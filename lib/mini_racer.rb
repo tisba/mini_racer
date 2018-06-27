@@ -258,6 +258,15 @@ module MiniRacer
           @thread_raise_called = true
         end
       }
+
+      i = 0
+      while i < 1000
+        i += 1
+        @callback_mutex.synchronize{
+          return if !@callback_running
+        }
+        sleep 0.001
+      end
     end
 
     def timeout(&blk)

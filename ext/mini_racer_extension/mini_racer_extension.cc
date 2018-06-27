@@ -92,6 +92,7 @@ private:
 typedef struct {
     IsolateInfo* isolate_info;
     Persistent<Context>* context;
+    volatile bool terminate;
 } ContextInfo;
 
 typedef struct {
@@ -128,6 +129,7 @@ enum IsolateFlags {
     DO_TERMINATE,
     MEM_SOFTLIMIT_VALUE,
     MEM_SOFTLIMIT_REACHED,
+    IN_RUBY_FUNCTION,
 };
 
 static VALUE rb_cContext;
@@ -301,12 +303,12 @@ nogvl_context_eval(void* arg) {
 
     // in gvl flag
     isolate->SetData(IN_GVL, (void*)false);
-    // terminate ASAP
-    isolate->SetData(DO_TERMINATE, (void*)false);
     // Memory softlimit
     isolate->SetData(MEM_SOFTLIMIT_VALUE, (void*)false);
     // Memory softlimit hit flag
     isolate->SetData(MEM_SOFTLIMIT_REACHED, (void*)false);
+
+    isolate->SetData(IN_RUBY_FUNCTION, (void*)false);
 
     MaybeLocal<Script> parsed_script;
 
@@ -782,6 +784,8 @@ static VALUE rb_context_eval_unsafe(VALUE self, VALUE str, VALUE filename) {
     Data_Get_Struct(self, ContextInfo, context_info);
     Isolate* isolate = context_info->isolate_info->isolate;
 
+    context_info->terminate = false;
+
     if(TYPE(str) != T_STRING) {
         rb_raise(rb_eArgError, "wrong type argument %" PRIsVALUE " (should be a string)",
                 rb_obj_class(str));
@@ -870,6 +874,8 @@ gvl_ruby_callback(void* data) {
     VALUE result;
     VALUE self;
     VALUE parent;
+    ContextInfo* context_info;
+
     {
         HandleScope scope(args->GetIsolate());
         Local<External> external = Local<External>::Cast(args->Data());
@@ -882,7 +888,6 @@ gvl_ruby_callback(void* data) {
             return NULL;
         }
 
-        ContextInfo* context_info;
         Data_Get_Struct(parent, ContextInfo, context_info);
 
 	if (length > 0) {
@@ -903,15 +908,19 @@ gvl_ruby_callback(void* data) {
     callback_data.args = ruby_args;
     callback_data.failed = false;
 
-    if ((bool)args->GetIsolate()->GetData(DO_TERMINATE) == true) {
+    printf("%i DO TERMINATE", context_info->terminate);
+    if (context_info->terminate) {
+
+	printf("DO TERMINATE\n");
+
 	args->GetIsolate()->ThrowException(String::NewFromUtf8(args->GetIsolate(), "Terminated execution during transition from Ruby to JS"));
-	args->GetIsolate()->TerminateExecution();
 	if (length > 0) {
 	    xfree(ruby_args);
 	}
 	return NULL;
     }
 
+    printf("calling rescue2 %lu\n", pthread_self());
     result = rb_rescue2((VALUE(*)(...))&protected_callback, (VALUE)(&callback_data),
 			(VALUE(*)(...))&rescue_callback, (VALUE)(&callback_data), rb_eException, (VALUE)0);
 
@@ -929,15 +938,12 @@ gvl_ruby_callback(void* data) {
 	xfree(ruby_args);
     }
 
-    if ((bool)args->GetIsolate()->GetData(DO_TERMINATE) == true) {
-      Isolate* isolate = args->GetIsolate();
-      isolate->TerminateExecution();
-    }
-
     return NULL;
 }
 
 static void ruby_callback(const FunctionCallbackInfo<Value>& args) {
+
+    args.GetIsolate()->SetData(IN_RUBY_FUNCTION, (void*)true);
     bool has_gvl = (bool)args.GetIsolate()->GetData(IN_GVL);
 
     if(has_gvl) {
@@ -947,6 +953,7 @@ static void ruby_callback(const FunctionCallbackInfo<Value>& args) {
 	rb_thread_call_with_gvl(gvl_ruby_callback, (void*)(&args));
 	args.GetIsolate()->SetData(IN_GVL, (void*)false);
     }
+    args.GetIsolate()->SetData(IN_RUBY_FUNCTION, (void*)false);
 }
 
 
@@ -1178,16 +1185,25 @@ rb_heap_stats(VALUE self) {
 static VALUE
 rb_context_stop(VALUE self) {
 
+    printf("before terminate\n");
+
     ContextInfo* context_info;
     Data_Get_Struct(self, ContextInfo, context_info);
 
     Isolate* isolate = context_info->isolate_info->isolate;
 
-    // flag for termination
-    isolate->SetData(DO_TERMINATE, (void*)true);
+    context_info->terminate = true;
+
+    rb_funcall(self, rb_intern("stop_attached"), 0);
+
+    if (!(bool)isolate->GetData(IN_RUBY_FUNCTION)) {
+	// do not try to mess up Ruby VM
+	printf("terminate not in ruby\n");
+    } else {
+	printf("terminate yes in ruby\n");
+    }
 
     isolate->TerminateExecution();
-    rb_funcall(self, rb_intern("stop_attached"), 0);
 
     return Qnil;
 }
@@ -1214,8 +1230,6 @@ nogvl_context_call(void *args) {
 
     // in gvl flag
     isolate->SetData(IN_GVL, (void*)false);
-    // terminate ASAP
-    isolate->SetData(DO_TERMINATE, (void*)false);
 
     Isolate::Scope isolate_scope(isolate);
     EscapableHandleScope handle_scope(isolate);
@@ -1250,6 +1264,8 @@ rb_context_call_unsafe(int argc, VALUE *argv, VALUE self) {
 
     Data_Get_Struct(self, ContextInfo, context_info);
     Isolate* isolate = context_info->isolate_info->isolate;
+
+    context_info->terminate = false;
 
     if (argc < 1) {
         rb_raise(rb_eArgError, "need at least one argument %d", argc);
